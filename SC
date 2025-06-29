@@ -1,0 +1,363 @@
+pragma solidity ^0.8.20;
+
+import "abdk-libraries-solidity/ABDKMath64x64.sol";
+
+interface IERC20Minimal {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+    function decimals() external view returns (uint8);
+}
+
+contract LMSRPredictionMarket {
+    using ABDKMath64x64 for int128;
+
+    // ─────────────── Grundlegende State‐Variablen ───────────────
+    IERC20Minimal public immutable token;       // z.B. SPT (18 Dezimalstellen)
+    address       public immutable owner;       // Marktbetreiber
+    string        public      question;         // Frage‐Text
+
+    // Pools (in Mikro‐Shares, 6 Dezimalstellen)
+    uint256 public qYes;   // kumulierte YES‐Mikro‐Shares
+    uint256 public qNo;    // kumulierte NO‐Mikro‐Shares
+
+    bool public resolved;  // true = Markt geschlossen, Outcome festgelegt
+    bool public outcome;   // false = NO hat gewonnen, true = YES hat gewonnen
+
+    // Nutzer‐Salden
+    mapping(address => uint256) public yesShares;
+    mapping(address => uint256) public noShares;
+
+    // avgEntry‐Berechnung
+    mapping(address => uint256) private weightedEntryYes;
+    mapping(address => uint256) private weightedEntryNo;
+    mapping(address => uint256) private totalYesBought;
+    mapping(address => uint256) private totalNoBought;
+
+    // Payout‐Tracking
+    mapping(address => bool) public hasClaimed;
+    address[] public participants;
+    mapping(address => bool) private isParticipant;
+
+    // House Maker‐Funds
+    uint256 public makerFunds;
+
+    // ─────────────── Konstanten & Parameter ───────────────
+    uint8  public immutable TOKEN_DECIMALS;
+    uint256 public constant SHARE_DECIMALS = 6;
+    uint256 public constant MICRO = 10 ** SHARE_DECIMALS;
+    uint256 public constant DEC_DIFF = 12; // 18 – 6 = 12
+
+    uint256 public constant MULTIPLIER = 20;
+    uint256 public constant PAYOUT_PER_SHARE = 20 * 10**18;
+
+    uint256 public constant TRADE_FEE_PERCENT   = 5;
+    uint256 public constant RESOLVE_FEE_PERCENT = 10;
+    address public constant FEE_WALLET = 0xE82EC45cF1eD5162659ee872328B28e5c109b008;
+
+    bool private _locked;
+
+    // LMSR‐Liquiditätsparameter in 64.64‐Format
+    int128 public immutable b;
+
+    // ─────────────── Events ───────────────
+    event FeePaid(address indexed wallet, uint256 amountWei);
+    event BoughtLMSR(address indexed buyer, bool isYes, uint256 sharesMicro, uint256 costWei);
+    event SoldLMSR(address indexed seller, bool isYes, uint256 sharesMicro, uint256 payoutWei);
+    event MakerFunded(address indexed owner, uint256 amountWei);
+    event MakerWithdrawn(address indexed owner, uint256 amountWei);
+    event Resolved(bool outcome);
+    event Claimed(address indexed user, uint256 payoutWei);
+    event QuestionUpdated(string question);
+
+    // ─────────────── Modifiers ───────────────
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+    modifier onlyWhileOpen() {
+        require(!resolved, "Market resolved");
+        _;
+    }
+    modifier nonReentrant() {
+        require(!_locked, "Reentrant call");
+        _locked = true;
+        _;
+        _locked = false;
+    }
+
+    // ─────────────── Constructor ───────────────
+    constructor(address _token, string memory _question) {
+        token    = IERC20Minimal(_token);
+        owner    = msg.sender;
+        question = _question;
+        TOKEN_DECIMALS = token.decimals();
+
+        // Initiale Liquidität: 100 Voll‐Shares (in Mikro)
+        qYes = 100 * MICRO;
+        qNo  = 100 * MICRO;
+
+        makerFunds = 0;
+
+        // Setze b = 100 Voll‐Shares (in Mikro) als 64.64‐Wert
+        b = ABDKMath64x64.fromUInt(100 * MICRO);
+    }
+
+    receive() external payable { revert("No ETH"); }
+    fallback() external payable { revert("No ETH"); }
+
+    // ─────────────── Teilnehmer tracken ───────────────
+    function _addParticipant(address user) internal {
+        if (!isParticipant[user]) {
+            participants.push(user);
+            isParticipant[user] = true;
+        }
+    }
+
+    // ─────────────── LMSR‐Hilfsfunktion ───────────────
+    function _cost(int128 qYes64, int128 qNo64) internal view returns (int128) {
+        // C(q) = b * ln( e^(qYes/b) + e^(qNo/b) )
+        int128 eYes = qYes64.div(b).exp();
+        int128 eNo  = qNo64.div(b).exp();
+        return b.mul( (eYes.add(eNo)).ln() );
+    }
+
+    // ─────────────── 1) House Maker ───────────────
+    function fundMaker(uint256 amountWei) external onlyOwner nonReentrant {
+        require(amountWei > 0, "Amount must be > 0");
+        token.transferFrom(msg.sender, address(this), amountWei);
+        makerFunds += amountWei;
+        emit MakerFunded(msg.sender, amountWei);
+    }
+
+    function withdrawMaker(uint256 amountWei) external onlyOwner nonReentrant {
+        require(amountWei > 0, "Amount must be > 0");
+        require(makerFunds >= amountWei, "Not enough maker funds");
+        makerFunds -= amountWei;
+        token.transfer(msg.sender, amountWei);
+        emit MakerWithdrawn(msg.sender, amountWei);
+    }
+
+    function houseTrade(bool pushYes, uint256 sharesMicro)
+        public onlyOwner nonReentrant onlyWhileOpen
+    {
+        require(sharesMicro > 0, "Zero shares");
+
+        // LMSR‐Cost‐Differenz berechnen
+        int128 oldYes64 = ABDKMath64x64.fromUInt(qYes);
+        int128 oldNo64  = ABDKMath64x64.fromUInt(qNo);
+        int128 costOld  = _cost(oldYes64, oldNo64);
+
+        int128 newYes64 = pushYes
+            ? ABDKMath64x64.fromUInt(qYes + sharesMicro)
+            : oldYes64;
+        int128 newNo64  = !pushYes
+            ? ABDKMath64x64.fromUInt(qNo + sharesMicro)
+            : oldNo64;
+        int128 costNew  = _cost(newYes64, newNo64);
+
+        int128 costDiff = costNew.sub(costOld);
+        uint256 costWeiBase = costDiff.mulu(10 ** DEC_DIFF);
+        uint256 costWei     = costWeiBase * MULTIPLIER;
+
+        uint256 feeWei = (costWei * TRADE_FEE_PERCENT) / 100;
+        uint256 totalWei = costWei + feeWei;
+        require(makerFunds >= totalWei, "Insufficient makerFunds");
+
+        makerFunds -= totalWei;
+        token.transfer(FEE_WALLET, feeWei);
+        emit FeePaid(FEE_WALLET, feeWei);
+
+        if (pushYes) {
+            qYes += sharesMicro;
+        } else {
+            qNo += sharesMicro;
+        }
+    }
+
+    // ─────────────── 2) Buy / Sell ───────────────
+    function buyAuto(bool isYes, uint256 sharesWantedMicro)
+        external onlyWhileOpen nonReentrant
+    {
+        require(sharesWantedMicro > 0, "Zero shares requested");
+
+        int128 oldYes64 = ABDKMath64x64.fromUInt(qYes);
+        int128 oldNo64  = ABDKMath64x64.fromUInt(qNo);
+        int128 newYes64 = isYes
+            ? ABDKMath64x64.fromUInt(qYes + sharesWantedMicro)
+            : oldYes64;
+        int128 newNo64  = !isYes
+            ? ABDKMath64x64.fromUInt(qNo + sharesWantedMicro)
+            : oldNo64;
+
+        int128 costOld = _cost(oldYes64, oldNo64);
+        int128 costNew = _cost(newYes64, newNo64);
+        int128 costDiff = costNew.sub(costOld);
+
+        uint256 costWeiBase = costDiff.mulu(10 ** DEC_DIFF);
+        uint256 costWei     = costWeiBase * MULTIPLIER;
+        uint256 feeWei      = (costWei * TRADE_FEE_PERCENT) / 100;
+        uint256 totalWei    = costWei + feeWei;
+
+        require(makerFunds >= totalWei, "House fund insufficient");
+        token.transferFrom(msg.sender, address(this), totalWei);
+        token.transfer(FEE_WALLET, feeWei);
+        emit FeePaid(FEE_WALLET, feeWei);
+        makerFunds -= totalWei;
+
+        if (isYes) {
+            qYes += sharesWantedMicro;
+            yesShares[msg.sender] += sharesWantedMicro;
+            // avgEntry‐Update bleibt unverändert…
+            uint256 prevQty = totalYesBought[msg.sender];
+            uint256 prevSum = weightedEntryYes[msg.sender] * prevQty;
+            uint256 newSum  = prevSum + (getPrice(true) * sharesWantedMicro);
+            uint256 newQty  = prevQty + sharesWantedMicro;
+            weightedEntryYes[msg.sender] = newSum / newQty;
+            totalYesBought[msg.sender]   = newQty;
+        } else {
+            qNo += sharesWantedMicro;
+            noShares[msg.sender] += sharesWantedMicro;
+            uint256 prevQty = totalNoBought[msg.sender];
+            uint256 prevSum = weightedEntryNo[msg.sender] * prevQty;
+            uint256 newSum  = prevSum + (getPrice(false) * sharesWantedMicro);
+            uint256 newQty  = prevQty + sharesWantedMicro;
+            weightedEntryNo[msg.sender] = newSum / newQty;
+            totalNoBought[msg.sender]   = newQty;
+        }
+
+        _addParticipant(msg.sender);
+        emit BoughtLMSR(msg.sender, isYes, sharesWantedMicro, costWei);
+    }
+
+    function sellAuto(bool isYes, uint256 sharesToSellMicro)
+        external onlyWhileOpen nonReentrant
+    {
+        require(sharesToSellMicro > 0, "Zero shares requested");
+        if (isYes) {
+            require(yesShares[msg.sender] >= sharesToSellMicro, "Not enough YES shares");
+        } else {
+            require(noShares[msg.sender] >= sharesToSellMicro, "Not enough NO shares");
+        }
+
+        int128 oldYes64 = ABDKMath64x64.fromUInt(qYes);
+        int128 oldNo64  = ABDKMath64x64.fromUInt(qNo);
+        int128 newYes64 = isYes
+            ? ABDKMath64x64.fromUInt(qYes - sharesToSellMicro)
+            : oldYes64;
+        int128 newNo64  = !isYes
+            ? ABDKMath64x64.fromUInt(qNo - sharesToSellMicro)
+            : oldNo64;
+
+        int128 costOld = _cost(oldYes64, oldNo64);
+        int128 costNew = _cost(newYes64, newNo64);
+        int128 diff    = costOld.sub(costNew);
+
+        uint256 payoutWeiBase = diff.mulu(10 ** DEC_DIFF);
+        uint256 costWeiBase   = payoutWeiBase * MULTIPLIER;
+        uint256 feeWei        = (costWeiBase * TRADE_FEE_PERCENT) / 100;
+        uint256 payoutWei     = costWeiBase - feeWei;
+        uint256 totalNeedWei  = costWeiBase;
+
+        require(makerFunds >= totalNeedWei, "House fund insufficient");
+
+        if (isYes) {
+            yesShares[msg.sender] -= sharesToSellMicro;
+            qYes                -= sharesToSellMicro;
+        } else {
+            noShares[msg.sender] -= sharesToSellMicro;
+            qNo                 -= sharesToSellMicro;
+        }
+
+        token.transfer(msg.sender, payoutWei);
+        token.transfer(FEE_WALLET, feeWei);
+        emit FeePaid(FEE_WALLET, feeWei);
+        emit SoldLMSR(msg.sender, isYes, sharesToSellMicro, payoutWei);
+
+        makerFunds -= totalNeedWei;
+        _addParticipant(msg.sender);
+
+        // avgEntry‐Cleanup bleibt unverändert…
+        if (isYes && yesShares[msg.sender] == 0) {
+            weightedEntryYes[msg.sender] = 0;
+            totalYesBought[msg.sender]   = 0;
+        }
+        if (!isYes && noShares[msg.sender] == 0) {
+            weightedEntryNo[msg.sender] = 0;
+            totalNoBought[msg.sender]   = 0;
+        }
+    }
+
+    // ─────────────── 3) LMSR‐Preisfunktion ───────────────
+    function getPrice(bool isYes) public view returns (uint256) {
+        int128 qYes64 = ABDKMath64x64.fromUInt(qYes);
+        int128 qNo64  = ABDKMath64x64.fromUInt(qNo);
+        int128 num    = (isYes ? qYes64 : qNo64).div(b).exp();
+        int128 den    = qYes64.div(b).exp().add(qNo64.div(b).exp());
+        // Skaliere p∈[0..1] auf 1e6
+        return uint256( num.div(den).mulu(1e6) );
+    }
+
+    // ─────────────── Die restlichen Funktionen unverändert ───────────────
+    function updateQuestion(string calldata _question) external onlyOwner onlyWhileOpen {
+        question = _question;
+        emit QuestionUpdated(_question);
+    }
+
+    function setOutcome(bool _outcome) external onlyOwner nonReentrant {
+        require(!resolved, "Already resolved");
+        resolved = true;
+        outcome  = _outcome;
+        emit Resolved(_outcome);
+        for (uint256 i = 0; i < participants.length; i++) {
+            address user = participants[i];
+            if (hasClaimed[user]) continue;
+            uint256 userSharesMicro = _outcome ? yesShares[user] : noShares[user];
+            if (userSharesMicro < MICRO) {
+                hasClaimed[user] = true;
+                continue;
+            }
+            uint256 fullShares = userSharesMicro / MICRO;
+            uint256 payoutWei  = fullShares * PAYOUT_PER_SHARE;
+            uint256 feeWei     = (payoutWei * RESOLVE_FEE_PERCENT) / 100;
+            uint256 netPayout  = payoutWei - feeWei;
+            token.transfer(user, netPayout);
+            token.transfer(FEE_WALLET, feeWei);
+            emit Claimed(user, netPayout);
+            emit FeePaid(FEE_WALLET, feeWei);
+            hasClaimed[user] = true;
+        }
+        delete participants;
+    }
+
+    function getHeldShares(address user) external view returns (uint256 yesHeldMicro, uint256 noHeldMicro) {
+        return (yesShares[user], noShares[user]);
+    }
+
+    function getTotalPool() external view returns (uint256) {
+        return qYes + qNo;
+    }
+
+    function getMakerFunds() external view returns (uint256) {
+        return makerFunds;
+    }
+
+    function getAverageEntry(address user, bool isYes) external view returns (uint256) {
+        return isYes ? weightedEntryYes[user] : weightedEntryNo[user];
+    }
+
+    function getPnL(address user) external view returns (int256) {
+        uint256 yesQty = yesShares[user];
+        uint256 noQty  = noShares[user];
+        uint256 priceYes = getPrice(true);
+        uint256 priceNo  = getPrice(false);
+        uint256 avgYes   = weightedEntryYes[user];
+        uint256 avgNo    = weightedEntryNo[user];
+        int256 deltaYesRaw = int256(priceYes) - int256(avgYes);
+        int256 pnlYesMicro = deltaYesRaw * int256(yesQty);
+        int256 deltaNoRaw  = int256(priceNo) - int256(avgNo);
+        int256 pnlNoMicro  = deltaNoRaw * int256(noQty);
+        int256 totalPnlMicro = pnlYesMicro + pnlNoMicro;
+        return (totalPnlMicro * int256(10 ** DEC_DIFF) * int256(MULTIPLIER)) / int256(1e6);
+    }
+}
